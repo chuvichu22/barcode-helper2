@@ -183,6 +183,7 @@ li button{width:100%;text-align:left;background:#fff;border:2px solid var(--line
     <select id="o_unit">
       <option value="qty">수량 (개)</option>
       <option value="box">박스</option>
+      <option value="remain">잔여수량</option>
       <option value="soldout">품절</option>
       <option value="none">품목만 (수량 없음)</option>
     </select>
@@ -246,6 +247,7 @@ function formatUnit(item){
   if(item.unit==='soldout') return '품절';
   if(item.unit==='none') return '';
   if(item.unit==='box') return (item.qty||1)+'박스';
+  if(item.unit==='remain') return '잔여 '+(item.qty||1)+'개';
   return (item.qty||1)+'개';
 }
 
@@ -301,6 +303,7 @@ async function init(){
     buildEmpSelect('o_emp');
     restoreOrderSelection();
     msg('카메라를 켜고 바코드를 네모 칸에 맞추세요.');
+    loadZX();
   }catch(e){
     console.error(e);
     msg('데이터를 불러오지 못했습니다.','err');
@@ -560,24 +563,40 @@ $('btnSaveAdd').onclick=()=>{
 let eStream=null, eScanning=false, eLast='', eStreak=0;
 
 async function startExpiryScan(){
-  if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia){
+  if(!window.isSecureContext||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
     $('escanMsg').textContent='카메라는 https에서만 가능합니다.';
     return;
   }
   try{
-    if(!eStream){
-      try{ eStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false}); }
-      catch(e){ eStream=await navigator.mediaDevices.getUserMedia({video:true,audio:false}); }
-      const v=$('ev'); v.srcObject=eStream; v.muted=true;
-      v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
+    // 다른 탭 카메라 정리 (충돌 방지)
+    stopScan();
+    stopOrderScan();
+    if(stream){ try{ stream.getTracks().forEach(function(tr){ tr.stop(); }); }catch(e){} stream=null; }
+    if(oStream){ try{ oStream.getTracks().forEach(function(tr){ tr.stop(); }); }catch(e){} oStream=null; }
+    if(eStream){ try{ eStream.getTracks().forEach(function(tr){ tr.stop(); }); }catch(e){} eStream=null; }
+
+    try{
+      eStream=await navigator.mediaDevices.getUserMedia({
+        video:{ facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} },
+        audio:false
+      });
+    }catch(e){
+      eStream=await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
     }
-    await $('ev').play();
+    const v=$('ev');
+    v.srcObject=eStream;
+    v.muted=true;
+    v.setAttribute('playsinline','');
+    v.setAttribute('webkit-playsinline','');
+    await v.play();
     $('expiryCamBox').classList.remove('hidden');
     eScanning=true; eLast=''; eStreak=0;
     $('escanMsg').textContent='바코드를 네모 칸에 맞추세요';
     await initBD();
+    if(!zx) loadZX();
     expiryTick();
   }catch(e){
+    console.error(e);
     $('escanMsg').textContent='카메라를 켤 수 없습니다.';
   }
 }
@@ -595,25 +614,33 @@ async function expiryTick(){
   if(v.readyState>=2 && v.videoWidth){
     try{ if(bd) code=await readBD(v); }catch(e){ bd=false; loadZX(); }
     if(!code && zx) code=readZX(v);
+    if(!code && !zx) loadZX();
   }
   if(code){
-    if(!ean13ok(code)) {}
-    else if(code===eLast) eStreak++;
-    else { eLast=code; eStreak=1; }
-    if(eStreak>=2){
-      const p = byFull.get(code);
-      if(p){
+    const dig = digits(code);
+    let p = null;
+    if(ean13ok(dig)) p = byFull.get(dig);
+    if(!p && dig.length >= 6){
+      const six = dig.slice(-6);
+      p = byCode.get(six) || byFull.get(PREFIX + six);
+    }
+    if(p){
+      if(dig === eLast || (eLast && dig.slice(-6) === eLast.slice(-6))) eStreak++;
+      else { eLast = dig; eStreak = 1; }
+      $('escanMsg').textContent = '인식 중... (' + eStreak + ')';
+      if(eStreak >= 1){
         if(navigator.vibrate) navigator.vibrate(60);
         setSelectedExpiryProduct(p);
         stopExpiryScan();
         showToast('제품이 선택되었습니다');
-      } else {
-        $('escanMsg').textContent='등록되지 않은 바코드입니다';
-        eLast=''; eStreak=0;
+        return;
       }
+    } else if(dig.length === 13){
+      $('escanMsg').textContent = '등록되지 않은 바코드입니다';
+      eLast = ''; eStreak = 0;
     }
   }
-  if(eScanning) setTimeout(expiryTick, 120);
+  if(eScanning) setTimeout(expiryTick, 80);
 }
 
 // ===== 발주 =====
@@ -635,6 +662,7 @@ function renderOrderList(){
         <select class="unit-select" data-idx="${idx}">
           <option value="qty" ${item.unit==='qty'?'selected':''}>수량</option>
           <option value="box" ${item.unit==='box'?'selected':''}>박스</option>
+          <option value="remain" ${item.unit==='remain'?'selected':''}>잔여수량</option>
           <option value="soldout" ${item.unit==='soldout'?'selected':''}>품절</option>
           <option value="none" ${item.unit==='none'?'selected':''}>품목만</option>
         </select>
@@ -781,24 +809,40 @@ $('btnResetAll').onclick=()=>{
 let oStream=null, oScanning=false, oLast='', oStreak=0;
 
 async function startOrderScan(){
-  if(!window.isSecureContext||!navigator.mediaDevices?.getUserMedia){
+  if(!window.isSecureContext||!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
     $('oscanMsg').textContent='카메라는 https에서만 가능합니다.';
     return;
   }
   try{
-    if(!oStream){
-      try{ oStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}},audio:false}); }
-      catch(e){ oStream=await navigator.mediaDevices.getUserMedia({video:true,audio:false}); }
-      const v=$('ov'); v.srcObject=oStream; v.muted=true;
-      v.setAttribute('playsinline',''); v.setAttribute('webkit-playsinline','');
+    // 다른 탭 카메라 정리 (충돌 방지)
+    stopScan();
+    stopExpiryScan();
+    if(stream){ try{ stream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} stream=null; }
+    if(eStream){ try{ eStream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} eStream=null; }
+
+    if(oStream){ try{ oStream.getTracks().forEach(function(t){ t.stop(); }); }catch(e){} oStream=null; }
+    try{
+      oStream=await navigator.mediaDevices.getUserMedia({
+        video:{ facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} },
+        audio:false
+      });
+    }catch(e){
+      oStream=await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
     }
-    await $('ov').play();
+    const v=$('ov');
+    v.srcObject=oStream;
+    v.muted=true;
+    v.setAttribute('playsinline','');
+    v.setAttribute('webkit-playsinline','');
+    await v.play();
     $('orderCamBox').classList.remove('hidden');
     oScanning=true; oLast=''; oStreak=0;
     $('oscanMsg').textContent='바코드를 네모 칸에 맞추세요';
     await initBD();
+    if(!zx) loadZX();
     orderTick();
   }catch(e){
+    console.error(e);
     $('oscanMsg').textContent='카메라를 켤 수 없습니다.';
   }
 }
@@ -816,25 +860,34 @@ async function orderTick(){
   if(v.readyState>=2 && v.videoWidth){
     try{ if(bd) code=await readBD(v); }catch(e){ bd=false; loadZX(); }
     if(!code && zx) code=readZX(v);
+    if(!code && !zx) loadZX();
   }
   if(code){
-    if(!ean13ok(code)) {}
-    else if(code===oLast) oStreak++;
-    else { oLast=code; oStreak=1; }
-    if(oStreak>=2){
-      const p = byFull.get(code);
-      if(p){
+    const dig = digits(code);
+    // 13자리 검증 통과 또는 등록된 6자리/13자리 매칭
+    let p = null;
+    if(ean13ok(dig)) p = byFull.get(dig);
+    if(!p && dig.length >= 6){
+      const six = dig.slice(-6);
+      p = byCode.get(six) || byFull.get(PREFIX + six);
+    }
+    if(p){
+      if(dig === oLast || (oLast && dig.slice(-6) === oLast.slice(-6))) oStreak++;
+      else { oLast = dig; oStreak = 1; }
+      $('oscanMsg').textContent = '인식 중... (' + oStreak + ')';
+      if(oStreak >= 1){
         if(navigator.vibrate) navigator.vibrate(60);
         setSelectedOrderProduct(p);
         stopOrderScan();
         showToast('제품이 선택되었습니다');
-      } else {
-        $('oscanMsg').textContent='등록되지 않은 바코드입니다';
-        oLast=''; oStreak=0;
+        return;
       }
+    } else if(dig.length === 13){
+      $('oscanMsg').textContent = '등록되지 않은 바코드입니다';
+      oLast = ''; oStreak = 0;
     }
   }
-  if(oScanning) setTimeout(orderTick, 120);
+  if(oScanning) setTimeout(orderTick, 80);
 }
 
 // 탭
@@ -901,11 +954,27 @@ async function startCam(){
 function stopScan(){ scanning=false; try{$('v').pause()}catch(e){} }
 async function readBD(v){ const r=await bd.detect(v); for(const b of r){ const d=digits(b.rawValue); if(d.length===13) return d; } return null; }
 function readZX(v){
-  const W=v.videoWidth,H=v.videoHeight,sw=Math.round(W*.9),sh=Math.round(H*.5),k=Math.min(1,1000/sw);
-  cv.width=Math.round(sw*k); cv.height=Math.round(sh*k);
-  cx.drawImage(v,(W-sw)>>1,(H-sh)>>1,sw,sh,0,0,cv.width,cv.height);
-  try{ const b=new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(new ZXing.HTMLCanvasElementLuminanceSource(cv))); return digits(zx.decode(b).getText()); }
-  catch(e){ return null; }
+  if(!zx || !v.videoWidth) return null;
+  const W=v.videoWidth, H=v.videoHeight;
+  // 여러 영역 시도 (중앙 넓게 / 조금 더 좁게)
+  const tries = [
+    {sw: Math.round(W*0.95), sh: Math.round(H*0.55)},
+    {sw: Math.round(W*0.85), sh: Math.round(H*0.40)},
+    {sw: Math.round(W*0.98), sh: Math.round(H*0.70)}
+  ];
+  for(let i=0;i<tries.length;i++){
+    const sw=tries[i].sw, sh=tries[i].sh;
+    const k=Math.min(1, 1200/sw);
+    cv.width=Math.max(1, Math.round(sw*k));
+    cv.height=Math.max(1, Math.round(sh*k));
+    cx.drawImage(v, (W-sw)>>1, (H-sh)>>1, sw, sh, 0, 0, cv.width, cv.height);
+    try{
+      const b=new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(new ZXing.HTMLCanvasElementLuminanceSource(cv)));
+      const text=digits(zx.decode(b).getText());
+      if(text) return text;
+    }catch(e){}
+  }
+  return null;
 }
 async function tick(){
   if(!scanning) return;
